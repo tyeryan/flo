@@ -158,7 +158,7 @@ func main() {
 	fmt.Println("Initializing schema for database done")
 
 	// step 2: parse NEM12 file
-	filePath := flag.String("file", "test.csv", "path to the NEM12 input file")
+	filePath := flag.String("f", "test.csv", "path to the NEM12 input file")
 	flag.Parse()
 
 	nem12File, err := parser.ParseFile(*filePath)
@@ -236,6 +236,10 @@ func (p *NEM12FileParser) ParseFile(filename string) (*NEM12File, error) {
 	var currentNMIBlock *NMIDataBlock
 	lineNumber := 0
 
+	// Track parsing state for hierarchy validation
+	hasHeader := false
+	hasNMIBlock := false
+
 	// Handle broken lines - accumulate line fragments
 	var currentLine strings.Builder
 
@@ -256,11 +260,13 @@ func (p *NEM12FileParser) ParseFile(filename string) (*NEM12File, error) {
 			strings.HasPrefix(line, "900")
 
 		if startsWithRecordType && currentLine.Len() > 0 {
-			newBlock, err := p.processLine(nem12File, currentNMIBlock, currentLine.String(), lineNumber-1)
+			newBlock, newHasHeader, newHasNMIBlock, err := p.processLine(nem12File, currentNMIBlock, currentLine.String(), lineNumber-1, hasHeader, hasNMIBlock)
 			if err != nil {
 				return nil, err
 			}
 			currentNMIBlock = newBlock
+			hasHeader = newHasHeader
+			hasNMIBlock = newHasNMIBlock
 			currentLine.Reset()
 		}
 
@@ -268,22 +274,24 @@ func (p *NEM12FileParser) ParseFile(filename string) (*NEM12File, error) {
 
 		// If line doesn't end with comma and starts with record type, it's complete
 		if !strings.HasSuffix(line, ",") && startsWithRecordType {
-			newBlock, err := p.processLine(nem12File, currentNMIBlock, currentLine.String(), lineNumber)
+			newBlock, newHasHeader, newHasNMIBlock, err := p.processLine(nem12File, currentNMIBlock, currentLine.String(), lineNumber, hasHeader, hasNMIBlock)
 			if err != nil {
 				return nil, err
 			}
 			currentNMIBlock = newBlock
+			hasHeader = newHasHeader
+			hasNMIBlock = newHasNMIBlock
 			currentLine.Reset()
 		}
 	}
 
 	// Process any remaining line
 	if currentLine.Len() > 0 {
-		newBlock, err := p.processLine(nem12File, currentNMIBlock, currentLine.String(), lineNumber)
+		var err error
+		currentNMIBlock, _, _, err = p.processLine(nem12File, currentNMIBlock, currentLine.String(), lineNumber, hasHeader, hasNMIBlock)
 		if err != nil {
 			return nil, err
 		}
-		currentNMIBlock = newBlock
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -294,76 +302,112 @@ func (p *NEM12FileParser) ParseFile(filename string) (*NEM12File, error) {
 }
 
 // processLine handles a single complete NEM12 record line
-func (p *NEM12FileParser) processLine(nem12File *NEM12File, currentNMIBlock *NMIDataBlock, line string, lineNumber int) (*NMIDataBlock, error) {
+// Returns: (updatedNMIBlock, updatedHasHeader, updatedHasNMIBlock, error)
+func (p *NEM12FileParser) processLine(nem12File *NEM12File, currentNMIBlock *NMIDataBlock, line string, lineNumber int, hasHeader bool, hasNMIBlock bool) (*NMIDataBlock, bool, bool, error) {
 	fields := strings.Split(line, ",")
 	if len(fields) == 0 {
-		return currentNMIBlock, nil
+		return currentNMIBlock, hasHeader, hasNMIBlock, nil
 	}
 
 	recordType := fields[0]
 
 	switch recordType {
 	case RecordType100:
+		// Validate: 100 record must be the first record in the file
+		if hasHeader {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 100 record must be the first record", lineNumber)
+		}
 		header, err := parse100Record(fields)
 		if err != nil {
-			return currentNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
 		}
 		nem12File.Header = *header
+		return currentNMIBlock, true, hasNMIBlock, nil
 
 	case RecordType200:
+		// Validate: 200 record must come after a 100 record
+		if !hasHeader {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 200 record must come after a 100 record", lineNumber)
+		}
+		// Validate: previous NMI block must have at least one 300 record
 		if currentNMIBlock != nil {
+			if len(currentNMIBlock.IntervalData) == 0 {
+				return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 200 record must be followed by at least one 300 record", lineNumber)
+			}
 			nem12File.NMIDataBlocks = append(nem12File.NMIDataBlocks, *currentNMIBlock)
 		}
 		dataDetails, err := parse200Record(fields)
 		if err != nil {
-			return currentNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
 		}
 		newBlock := &NMIDataBlock{
 			DataDetails: *dataDetails,
 		}
-		return newBlock, nil
+		return newBlock, hasHeader, true, nil
 
 	case RecordType300:
-		if currentNMIBlock == nil {
-			return currentNMIBlock, fmt.Errorf("line %d: 300 record without preceding 200 record", lineNumber)
+		// Validate: 300 record must come after a 200 record
+		if !hasHeader {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 300 record must come after a 100 record", lineNumber)
+		}
+		if currentNMIBlock == nil || !hasNMIBlock {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 300 record must come after a 200 record", lineNumber)
 		}
 		intervalData, err := parse300Record(fields)
 		if err != nil {
-			return currentNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
 		}
 		currentNMIBlock.IntervalData = append(currentNMIBlock.IntervalData, *intervalData)
+		return currentNMIBlock, hasHeader, hasNMIBlock, nil
 
 	case RecordType400:
-		if currentNMIBlock == nil {
-			return currentNMIBlock, fmt.Errorf("line %d: 400 record without preceding 200 record", lineNumber)
+		// Validate: 400 record must come after a 200 record
+		if !hasHeader {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 400 record must come after a 100 record", lineNumber)
+		}
+		if currentNMIBlock == nil || !hasNMIBlock {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 400 record must come after a 200 record", lineNumber)
 		}
 		intervalEvent, err := parse400Record(fields)
 		if err != nil {
-			return currentNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
 		}
 
 		currentNMIBlock.IntervalEvents = append(currentNMIBlock.IntervalEvents, *intervalEvent)
+		return currentNMIBlock, hasHeader, hasNMIBlock, nil
 
 	case RecordType500:
-		if currentNMIBlock == nil {
-			return currentNMIBlock, fmt.Errorf("line %d: 500 record without preceding 200 record", lineNumber)
+		// Validate: 500 record must come after a 200 record
+		if !hasHeader {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 500 record must come after a 100 record", lineNumber)
+		}
+		if currentNMIBlock == nil || !hasNMIBlock {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 500 record must come after a 200 record", lineNumber)
 		}
 		b2bDetail, err := parse500Record(fields)
 		if err != nil {
-			return currentNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: %w", lineNumber, err)
 		}
 		currentNMIBlock.B2BDetails = append(currentNMIBlock.B2BDetails, *b2bDetail)
+		return currentNMIBlock, hasHeader, hasNMIBlock, nil
 
 	case RecordType900:
-		// save last NMIBlock
+		// Validate: 900 record should come after at least one 200 record
+		if !hasHeader {
+			return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 900 record must come after a 100 record", lineNumber)
+		}
+		// Validate: current NMI block must have at least one 300 record
 		if currentNMIBlock != nil {
+			if len(currentNMIBlock.IntervalData) == 0 {
+				return currentNMIBlock, hasHeader, hasNMIBlock, fmt.Errorf("line %d: invalid file structure - 200 record must be followed by at least one 300 record", lineNumber)
+			}
 			nem12File.NMIDataBlocks = append(nem12File.NMIDataBlocks, *currentNMIBlock)
 		}
 		nem12File.TotalRecords = lineNumber
-		return currentNMIBlock, nil
+		return currentNMIBlock, hasHeader, hasNMIBlock, nil
 	}
 
-	return currentNMIBlock, nil
+	return currentNMIBlock, hasHeader, hasNMIBlock, nil
 }
 
 // According to document, Header Record
